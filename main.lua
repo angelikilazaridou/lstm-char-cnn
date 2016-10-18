@@ -52,7 +52,7 @@ cmd:option('-max_word_l',65,'maximum word length')
 cmd:option('-seed',3435,'torch manual random number generator seed')
 cmd:option('-print_every',500,'how many steps/minibatches between printing out the loss')
 cmd:option('-save_every', 5, 'save every n epochs')
-cmd:option('-checkpoint_dir', 'cv', 'output directory where checkpoints get written')
+cmd:option('-checkpoint_dir', 'cv_BRNN', 'output directory where checkpoints get written')
 cmd:option('-savefile','char','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
 cmd:option('-EOS', '+', '<EOS> symbol. should be a single unused character (like +) for PTB and blank for others')
 cmd:option('-time', 0, 'print batch times')
@@ -161,9 +161,12 @@ end
 -- the initial state of the cell/hidden states
 init_state = {}
 for L=1,opt.num_layers do
-    local h_init = torch.zeros(opt.batch_size, opt.rnn_size)
-    if opt.gpuid >=0 then h_init = h_init:cuda() end
-    table.insert(init_state, h_init:clone())
+    local h_init = torch.rand(opt.batch_size, opt.rnn_size)
+    h_init:uniform(-opt.param_init, opt.param_init)
+    local c_init = torch.rand(opt.batch_size, opt.rnn_size)
+    c_init:uniform(-opt.param_init, opt.param_init)
+    if opt.gpuid >=0 then h_init = h_init:cuda() c_init = c_init:cuda() end
+    table.insert(init_state, c_init:clone())
     table.insert(init_state, h_init:clone())
 end
 
@@ -231,8 +234,9 @@ function eval_split(split_idx, max_batches)
 
     loader:reset_batch_pointer(split_idx) -- move batch iteration pointer for this split to front
     local loss = 0
-    local rnn_state = {[0] = init_state}    
-    if split_idx<=2 then -- batch eval        
+       
+    if split_idx<=3 then -- batch eval        
+	local cnt = 0
 	for i = 1,n do -- iterate over batches in the split
 	    -- fetch a batch
 	    local x, y, x_char = loader:next_batch(split_idx)
@@ -243,20 +247,25 @@ function eval_split(split_idx, max_batches)
 		x_char = x_char:float():cuda()
 	    end
 	    -- forward pass
-	    for t=1,opt.seq_length do
-		clones.rnn[t]:evaluate() -- for dropout proper functioning
-		local lst = clones.rnn[t]:forward(get_input(x, x_char, t, rnn_state[t-1]))
-		rnn_state[t] = {}
-		for i=1,#init_state do 
-                    table.insert(rnn_state[t], lst[i])
-                end
-		prediction = lst[#lst]
-                loss = loss + clones.criterion[t]:forward(prediction, y[{{}, t}])
+	    for t = opt.seq_length, 1, -1 do
+		local rnn_state = {[t+1] = init_state}
+		for c = t, 1, -1 do
+			clones.rnn[c]:evaluate() -- for dropout proper functioning
+			local lst = clones.rnn[c]:forward(get_input(x, x_char, c, rnn_state[c+1]))
+			rnn_state[c] = {}
+			for i=1,#init_state do 
+                    		table.insert(rnn_state[c], lst[i])
+                	end
+			-- measure loss with maximum context only
+			prediction = lst[#lst]
+			if c == 1 then
+                		loss = loss + clones.criterion[c]:forward(prediction, y[{{}, t}])
+				cnt = cnt +1
+			end
+	    	end
 	    end
-	    -- carry over lstm state
-	    rnn_state[0] = rnn_state[#rnn_state]
 	end
-	loss = loss / opt.seq_length / n
+	loss = loss / cnt
     else -- full eval on test set
         local token_perp = torch.zeros(#loader.idx2word, 2) 
         local x, y, x_char = loader:next_batch(split_idx)
@@ -267,30 +276,41 @@ function eval_split(split_idx, max_batches)
 	    x_char = x_char:float():cuda()
 	end
 	protos.rnn:evaluate() -- just need one clone
-	for t = 1, x:size(2) do
-	    local lst = protos.rnn:forward(get_input(x, x_char, t, rnn_state[0]))
-	    rnn_state[0] = {}
-	    for i=1,#init_state do table.insert(rnn_state[0], lst[i]) end
-	    prediction = lst[#lst] 
-            local tok_perp
-            tok_perp = protos.criterion:forward(prediction, y[{{},t}])
-            loss = loss + tok_perp
-            token_perp[y[1][t]][1] = token_perp[y[1][t]][1] + 1 --count
-            token_perp[y[1][t]][2] = token_perp[y[1][t]][2] + tok_perp
+	local cnt = 0
+	for t = x:size(2),1,-1 do
+	    for c=t,1,-1 do
+	        local lst = protos.rnn:forward(get_input(x, x_char, t, rnn_state[0]))
+	        rnn_state[t+1] = {}
+	        for i=1,#init_state do table.insert(rnn_state[t+1], lst[i]) end
+	        prediction = lst[#lst] 
+                local tok_perp
+                tok_perp = protos.criterion:forward(prediction, y[{{},t}])
+                loss = loss + tok_perp
+                token_perp[y[1][t]][1] = token_perp[y[1][t]][1] + 1 --count
+                token_perp[y[1][t]][2] = token_perp[y[1][t]][2] + tok_perp
+	        cnt = cnt +1
+	    end
 	end
-	loss = loss / x:size(2)
+	loss = loss /cnt
     end    
     local perp = torch.exp(loss)    
     return perp, token_perp
 end
 
--- do fwd/bwd and return loss, grad_params
 local init_state_global = clone_list(init_state)
+
+
+-- do fwd/bwd and return loss, grad_params
 function feval(x)
+
+   
+    --local init_state_global = clone_list(init_state)
+    grad_params:zero()
+    local grad_params_2 = grad_params:clone()
+ 
     if x ~= params then
         params:copy(x)
     end
-    grad_params:zero()
     if opt.hsm > 0 then
         hsm_grad_params:zero()
     end
@@ -302,44 +322,54 @@ function feval(x)
         y = y:float():cuda()
 	x_char = x_char:float():cuda()
     end
-    ------------------- forward pass -------------------
-    local rnn_state = {[0] = init_state_global}
-    local predictions = {}           -- softmax outputs
+    ------------------ go over data  --------------------
     local loss = 0
-    for t=1,opt.seq_length do
-        clones.rnn[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)        
-        local lst = clones.rnn[t]:forward(get_input(x, x_char, t, rnn_state[t-1]))
-        rnn_state[t] = {}
-        for i=1,#init_state do 
-            table.insert(rnn_state[t], lst[i]) 
-        end -- extract the state, without output
-        predictions[t] = lst[#lst] -- last element is the prediction
-        loss = loss + clones.criterion[t]:forward(predictions[t], y[{{}, t}])
+    local cnt = 0
+    for t=opt.seq_length,1,-1 do	
+	local rnn_state = {[t+1] = init_state_global}
+	grad_params:zero()
+	------------------- forward pass -------------------
+	local predictions = {}
+	for c=t,1,-1 do
+        	clones.rnn[c]:training() -- make sure we are in correct mode (this is cheap, sets flag)     
+		local b = get_input(x, x_char, c, rnn_state[c+1])
+		local lst = clones.rnn[c]:forward(b)
+        	rnn_state[c] = {}
+        	for i=1,#init_state do 
+            		table.insert(rnn_state[c], lst[i]) 
+        	end -- extract the state, without output
+		predictions[c] = lst[#lst]
+		loss = loss + clones.criterion[c]:forward(predictions[c], y[{{}, t}])
+		cnt = cnt+1
+	end
+        ------------------ backward pass -------------------
+    	-- initialize gradient at time t to be zeros (there's no influence from future)
+    	local drnn_state = {[1] = clone_list(init_state, true)} -- true also zeros the clones
+	for c = 1, t do
+		-- backprop through loss, and softmax/linear
+		local doutput_t = clones.criterion[c]:backward(predictions[c], y[{{}, t}])
+        	table.insert(drnn_state[c], doutput_t)
+		--table.insert(rnn_state[c+1], drnn_state[c]) AL: why is this changing??
+        	local dlst = clones.rnn[c]:backward(get_input(x, x_char, c, rnn_state[c+1]), drnn_state[c])
+        	drnn_state[c+1] = {}
+		local tmp = opt.use_words + opt.use_chars -- not the safest way but quick
+        	for k,v in pairs(dlst) do
+            		if k > tmp then -- k == 1 is gradient on x, which we dont need
+                		-- note we do k-1 because first item is dembeddings, and then follow the 
+                		-- derivatives of the state, starting at index 2. I know...
+                		drnn_state[c+1][k-tmp] = v
+            		end
+        	end	
+    	end
+	grad_params_2 = grad_params_2 + grad_params:clone()
     end
-    loss = loss / opt.seq_length
-    ------------------ backward pass -------------------
-    -- initialize gradient at time t to be zeros (there's no influence from future)
-    local drnn_state = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones
-    for t=opt.seq_length,1,-1 do
-        -- backprop through loss, and softmax/linear
-        local doutput_t = clones.criterion[t]:backward(predictions[t], y[{{}, t}])
-        table.insert(drnn_state[t], doutput_t)
-	table.insert(rnn_state[t-1], drnn_state[t])
-        local dlst = clones.rnn[t]:backward(get_input(x, x_char, t, rnn_state[t-1]), drnn_state[t])
-        drnn_state[t-1] = {}
-	local tmp = opt.use_words + opt.use_chars -- not the safest way but quick
-        for k,v in pairs(dlst) do
-            if k > tmp then -- k == 1 is gradient on x, which we dont need
-                -- note we do k-1 because first item is dembeddings, and then follow the 
-                -- derivatives of the state, starting at index 2. I know...
-                drnn_state[t-1][k-tmp] = v
-            end
-        end	
-    end
+    loss = loss / cnt
 
+
+    grad_params:copy(grad_params_2)
     ------------------------ misc ----------------------
     -- transfer final state to initial state (BPTT)
-    init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
+    --init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
     
     -- renormalize gradients
     local grad_norm, shrink_factor
